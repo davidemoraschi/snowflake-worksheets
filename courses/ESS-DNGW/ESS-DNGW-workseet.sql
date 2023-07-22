@@ -400,8 +400,10 @@ where RAW_LOG:ip_address::text is not null;
 select * from AGS_GAME_AUDIENCE.RAW.PL_LOGS;
 
 create or replace task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED
-    warehouse = 'COMPUTE_WH'
-    schedule = '5 minute'
+    --warehouse = 'COMPUTE_WH'
+    --schedule = '5 minute'
+    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    after AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
   as
 merge into AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED e
 using (
@@ -451,8 +453,10 @@ VALUES(	IP_ADDRESS,
 	TOD_NAME );  
 
 create or replace task AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
-    warehouse = 'COMPUTE_WH'
-    schedule = '5 minute'
+    --warehouse = 'COMPUTE_WH'
+    --schedule = '5 minute'
+    schedule='5 Minutes'
+    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
   as
 copy into ags_game_audience.raw.pipeline_logs
 from @UNI_KISHORE_PIPELINE
@@ -460,3 +464,158 @@ file_format = (format_name=FF_JSON_LOGS);
 
 execute task AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES;
 select count(*) from AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED;
+
+--Turning on a task is done with a RESUME command
+alter task AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES resume;
+alter task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED resume;
+
+--Keep this code handy for shutting down the tasks each day
+alter task AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES suspend;
+alter task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED suspend;
+
+--Step 1 - how many files in the bucket?
+list @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE;
+
+--Step 2 - number of rows in raw table (should be file count x 10)
+select count(*) from AGS_GAME_AUDIENCE.RAW.PIPELINE_LOGS;
+
+--Step 3 - number of rows in raw table (should be file count x 10)
+select count(*) from AGS_GAME_AUDIENCE.RAW.PL_LOGS;
+
+--Step 4 - number of rows in enhanced table (should be file count x 10 but fewer rows is okay)
+select count(*) from AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED;
+
+use role accountadmin;
+grant EXECUTE MANAGED TASK on account to SYSADMIN;
+
+--switch back to sysadmin
+use role sysadmin;
+
+--USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL';
+
+ create table ED_PIPELINE_LOGS as SELECT 
+    METADATA$FILENAME as log_file_name --new metadata column
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id --new metadata column
+  , current_timestamp(0) as load_ltz --new local time of load
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+  (file_format => 'ff_json_logs');
+
+select * from ED_PIPELINE_LOGS;
+--truncate the table rows that were input during the CTAS
+truncate table ED_PIPELINE_LOGS;
+
+--reload the table using your COPY INTO
+COPY INTO ED_PIPELINE_LOGS
+FROM (
+    SELECT 
+    METADATA$FILENAME as log_file_name 
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id 
+  , current_timestamp(0) as load_ltz 
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+)
+file_format = (format_name = ff_json_logs);
+
+CREATE OR REPLACE PIPE GET_NEW_FILES
+auto_ingest=true
+aws_sns_topic='arn:aws:sns:us-west-2:321463406630:dngw_topic'
+AS 
+COPY INTO ED_PIPELINE_LOGS
+FROM (
+    SELECT 
+    METADATA$FILENAME as log_file_name 
+  , METADATA$FILE_ROW_NUMBER as log_file_row_id 
+  , current_timestamp(0) as load_ltz 
+  , get($1,'datetime_iso8601')::timestamp_ntz as DATETIME_ISO8601
+  , get($1,'user_event')::text as USER_EVENT
+  , get($1,'user_login')::text as USER_LOGIN
+  , get($1,'ip_address')::text as IP_ADDRESS    
+  FROM @AGS_GAME_AUDIENCE.RAW.UNI_KISHORE_PIPELINE
+)
+file_format = (format_name = ff_json_logs);
+
+
+create or replace task AGS_GAME_AUDIENCE.RAW.LOAD_LOGS_ENHANCED
+    --warehouse = 'COMPUTE_WH'
+    schedule = '5 minute'
+    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    --after AGS_GAME_AUDIENCE.RAW.GET_NEW_FILES
+  as
+merge into AGS_GAME_AUDIENCE.ENHANCED.LOGS_ENHANCED e
+using (
+SELECT logs.ip_address
+, logs.user_login AS GAMER_NAME
+, logs.user_event AS GAME_EVENT_NAME
+, logs.datetime_iso8601 AS GAME_EVENT_UTC
+, city
+, region
+, country
+, timezone AS GAMER_LTZ_NAME
+, CONVERT_TIMEZONE('UTC', timezone, logs.datetime_iso8601) as GAME_EVENT_LTZ
+, DAYNAME(GAME_EVENT_LTZ) as DOW_NAME
+, tod.tod_name
+from AGS_GAME_AUDIENCE.RAW.ED_PIPELINE_LOGS  logs
+JOIN IPINFO_GEOLOC.demo.location loc 
+ON IPINFO_GEOLOC.public.TO_JOIN_KEY(logs.ip_address) = loc.join_key
+AND IPINFO_GEOLOC.public.TO_INT(logs.ip_address) 
+BETWEEN start_ip_int AND end_ip_int
+JOIN raw.time_of_day_lu tod ON tod.hour = EXTRACT(HOUR FROM CONVERT_TIMEZONE('UTC', timezone, logs.datetime_iso8601))
+) r
+on r.GAMER_NAME = e.GAMER_NAME
+and r.GAME_EVENT_UTC = e.GAME_EVENT_UTC
+and r.GAME_EVENT_NAME = e.GAME_EVENT_NAME
+WHEN NOT MATCHED THEN
+INSERT(	IP_ADDRESS,
+	GAMER_NAME ,
+	GAME_EVENT_NAME,
+	GAME_EVENT_UTC ,
+	CITY ,
+	REGION ,
+	COUNTRY ,
+	GAMER_LTZ_NAME,
+	GAME_EVENT_LTZ ,
+	DOW_NAME ,
+	TOD_NAME )
+VALUES(	IP_ADDRESS,
+	GAMER_NAME ,
+	GAME_EVENT_NAME,
+	GAME_EVENT_UTC ,
+	CITY ,
+	REGION ,
+	COUNTRY ,
+	GAMER_LTZ_NAME,
+	GAME_EVENT_LTZ ,
+	DOW_NAME ,
+	TOD_NAME );  
+
+
+--create a stream that will keep track of changes to the table
+create or replace stream ags_game_audience.raw.ed_cdc_stream 
+on table AGS_GAME_AUDIENCE.RAW.ED_PIPELINE_LOGS;
+
+--look at the stream you created
+show streams;
+
+--check to see if any changes are pending
+select system$stream_has_data('ed_cdc_stream');
+
+--query the stream
+select * 
+from ags_game_audience.raw.ed_cdc_stream; 
+
+--check to see if any changes are pending
+select system$stream_has_data('ed_cdc_stream');
+
+--if your stream remains empty for more than 10 minutes, make sure your PIPE is running
+select SYSTEM$PIPE_STATUS('GET_NEW_FILES');
+
+--if you need to pause or unpause your pipe
+alter pipe GET_NEW_FILES set pipe_execution_paused = true;
+alter pipe GET_NEW_FILES set pipe_execution_paused = false;
